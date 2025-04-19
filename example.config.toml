@@ -1,0 +1,30 @@
+# Example Configuration File for ZMQ Service
+# This file demonstrates all available configuration options
+# Place your actual configuration at ~/.corky/config.toml
+
+# Logging Configuration
+[logging]
+# Path where log files will be written
+file_path = "/var/log/corky-service.log"
+# Log level: "trace", "debug", "info", "warn", or "error"
+level = "info"
+
+# Network Configuration Overrides
+[network]
+# ZMQ XSUB socket endpoint (Proxy) - default: "tcp://*:5557"
+# proxy_xsub_endpoint = "tcp://*:5557"
+
+# ZMQ XPUB socket endpoint (Proxy) - default: "tcp://*:5558"
+# proxy_xpub_endpoint = "tcp://*:5558"
+
+# ZMQ client-to-client direct messaging router endpoint - default: "tcp://*:6565"
+# This router handles direct client-to-client messaging with 3-frame messages
+# client_to_client_endpoint = "tcp://*:6565"
+
+# ZMQ client-facing router endpoint (Broker) - default: "tcp://*:5559"
+# This router receives messages from clients
+#client_facing_endpoint = "tcp://*:5559"
+
+# ZMQ worker-facing dealer endpoint (Broker) - default: "tcp://*:5560"
+# This dealer distributes work to backend workers
+# worker_facing_endpoint = "tcp://*:5560"
