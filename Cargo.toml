@@ -1,7 +1,18 @@
 [package]
-name = "service-zmq"
+name = "corky-zmq"
 version = "0.1.0"
 edition = "2021"
+
+[banner]
+ascii = """
+\\033[1;36m◉
+ \\033[1;37m│
+\\033[1;36m◉\\033[1;37m──▶\\033[1;36m◉\\033[1;37m──▶\\033[1;36m◉\\033[1;37m──▶\\033[1;36m◉
+ \\033[1;37m│
+\\033[1;36m◉
+\\033[0;31m  Corky ZMQ\\033[0m
+"""
+
 
 [dependencies]
 zmq = "0.10.0"
@@ -11,3 +22,7 @@ chrono = "0.4.31"
 toml = "0.8.8"
 serde = { version = "1.0", features = ["derive"] }
 dirs = "5.0.1"
+
+
+[corky] 
+is_corky_package = true

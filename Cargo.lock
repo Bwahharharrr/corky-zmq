@@ -89,6 +89,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "corky-zmq"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "dirs",
+ "fern",
+ "log",
+ "serde",
+ "toml",
+ "zmq",
+]
+
+[[package]]
 name = "crossbeam"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -448,19 +461,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "87607cb1398ed59d48732e575a4c28a7a8ebf2454b964fe3f224f2afc07909e1"
 dependencies = [
  "serde",
-]
-
-[[package]]
-name = "service-zmq"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "dirs",
- "fern",
- "log",
- "serde",
- "toml",
- "zmq",
 ]
 
 [[package]]

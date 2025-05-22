@@ -95,7 +95,7 @@ fn setup_logger(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         _ => log::LevelFilter::Info, // Default to Info if level is invalid
     };
 
-    // Configure `fern` logger to log to both stdout and a file:
+    // Configure `fern` logger to log only to stdout (removed file logging):
     fern::Dispatch::new()
         .format(|out, message, record| {
             out.finish(format_args!(
@@ -108,7 +108,6 @@ fn setup_logger(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         })
         .level(log_level)
         .chain(std::io::stdout())
-        .chain(fern::log_file(&config.logging.file_path)?)
         .apply()?;
     
     Ok(())
