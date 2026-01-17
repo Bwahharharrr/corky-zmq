@@ -1,5 +1,6 @@
 use std::fs;
-use std::process;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -13,9 +14,8 @@ use zmq;
 // ------------------------------- Constants -----------------------------------
 //
 
-const POLL_TIMEOUT_MS: i64 = 100; // poll timeout to allow periodic checks
-const RETRY_ATTEMPTS: usize = 3; // max attempts for transient ZMQ ops
-const RETRY_BACKOFF_MS: u64 = 3000; // backoff between retries (ms)
+const POLL_TIMEOUT_MS: i64 = 10; // poll timeout for low latency
+const RETRY_BACKOFF_MS: u64 = 3000; // backoff between connection retries (ms)
 
 const BYTES_PREVIEW_LEN: usize = 20; // byte preview length for non-UTF8 parts
 const MAX_OBJECT_KEYS: usize = 10; // keys to show when trimming top-level objects
@@ -25,6 +25,11 @@ const DEFAULT_PROXY_XPUB_ENDPOINT: &str = "tcp://*:5558";
 const DEFAULT_CLIENT_TO_CLIENT_ENDPOINT: &str = "tcp://*:6565";
 const DEFAULT_CLIENT_FACING_ENDPOINT: &str = "tcp://*:5559";
 const DEFAULT_WORKER_FACING_ENDPOINT: &str = "tcp://*:5560";
+
+// Poll index constants for broker
+const IDX_DIRECT_ROUTER: usize = 0;
+const IDX_CLIENT_ROUTER: usize = 1;
+const IDX_WORKER_DEALER: usize = 2;
 
 // Cropping controls (arrays)
 const MAX_DEPTH: usize = 2;                 // limit recursion for performance
@@ -37,6 +42,11 @@ const ROW_LIST_HEAD: usize = 1;             // arrays-of-arrays (e.g., OHLCV row
 const ROW_LIST_TAIL: usize = 1;             // arrays-of-arrays (e.g., OHLCV rows) tail
 const SCALAR_LIST_HEAD: usize = 3;          // arrays of scalars/strings head (e.g., colors)
 const SCALAR_LIST_TAIL: usize = 1;          // arrays of scalars/strings tail
+
+// Preferred keys to keep when trimming large top-level objects
+const IMPORTANT_KEYS: &[&str] = &[
+    "id", "symbol", "ticker", "type", "status", "desc", "timeframe", "title",
+];
 
 //
 // ------------------------------- Config --------------------------------------
@@ -51,9 +61,24 @@ struct Config {
 
 #[derive(Deserialize, Clone)]
 struct LoggingConfig {
-    #[allow(dead_code)]
-    file_path: String,
     level: String,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: "info".to_string(),
+        }
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            logging: LoggingConfig::default(),
+            network: NetworkConfig::default(),
+        }
+    }
 }
 
 #[derive(Deserialize, Clone)]
@@ -78,18 +103,24 @@ impl Default for NetworkConfig {
     }
 }
 
-fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
-    let home_dir = dirs::home_dir().ok_or("Could not determine home directory")?;
+fn load_config() -> Result<Config, String> {
+    let home_dir = match dirs::home_dir() {
+        Some(dir) => dir,
+        None => return Err("Could not determine home directory".to_string()),
+    };
     let config_path = home_dir.join(".corky").join("config.toml");
 
     if !config_path.exists() {
-        eprintln!("Configuration file not found at: {}", config_path.display());
-        eprintln!("Please get the latest configuration from GitHub.");
-        process::exit(1);
+        return Err(format!(
+            "Configuration file not found at: {}",
+            config_path.display()
+        ));
     }
 
-    let config_content = fs::read_to_string(&config_path)?;
-    let config: Config = toml::from_str(&config_content)?;
+    let config_content = fs::read_to_string(&config_path)
+        .map_err(|e| format!("Failed to read config: {}", e))?;
+    let config: Config = toml::from_str(&config_content)
+        .map_err(|e| format!("Failed to parse config: {}", e))?;
     Ok(config)
 }
 
@@ -98,6 +129,7 @@ fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
 //
 
 fn setup_logger(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    // Prefer RUST_LOG; otherwise fall back to config.logging.level.
     let mut builder = env_logger::Builder::from_env(env_logger::Env::default());
     if std::env::var("RUST_LOG").is_err() {
         let level = match config.logging.level.to_lowercase().as_str() {
@@ -115,33 +147,44 @@ fn setup_logger(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 //
-// -------------------------- Lightweight retry --------------------------------
+// -------------------------- Socket configuration -----------------------------
 //
 
-fn retry<F, T, E>(mut op: F, attempts: usize, backoff: Duration, name: &str) -> Result<T, E>
-where
-    F: FnMut() -> Result<T, E>,
-    E: std::fmt::Display,
-{
-    let mut try_no = 0usize;
-    loop {
-        match op() {
-            Ok(v) => return Ok(v),
-            Err(e) => {
-                try_no += 1;
-                error!("{} failed (attempt {}): {}", name, try_no, e);
-                if try_no >= attempts {
-                    return Err(e);
-                }
-                thread::sleep(backoff);
-            }
-        }
-    }
+fn configure_socket(socket: &zmq::Socket) -> Result<(), zmq::Error> {
+    socket.set_sndhwm(10_000)?; // Send high water mark (default 1000)
+    socket.set_rcvhwm(10_000)?; // Receive high water mark
+    socket.set_linger(1000)?; // 1s linger on close
+    socket.set_tcp_keepalive(1)?; // Enable TCP keepalive
+    socket.set_tcp_keepalive_idle(60)?;
+    socket.set_tcp_keepalive_intvl(10)?;
+    Ok(())
 }
 
 //
 // --------------------- Recursive JSON array cropping -------------------------
 //
+
+// Robust "row-like" detection: treat as list-of-arrays if >=80% of sampled
+// elements are arrays. Sample up to 32 elements, evenly spread.
+fn is_mostly_arrays(arr: &[Value]) -> bool {
+    let len = arr.len();
+    if len == 0 {
+        return false;
+    }
+    let sample_n = len.min(32).max(1);
+    let step = (len + sample_n - 1) / sample_n; // ceil(len/sample_n)
+    let mut arrays = 0usize;
+    let mut taken = 0usize;
+    let mut i = 0usize;
+    while i < len && taken < sample_n {
+        if matches!(arr[i], Value::Array(_)) {
+            arrays += 1;
+        }
+        taken += 1;
+        i += step;
+    }
+    arrays * 100 >= taken * 80
+}
 
 fn format_json_pretty(value: &Value) -> String {
     let cropped = crop_value(value, 0);
@@ -156,10 +199,10 @@ fn crop_value(value: &Value, depth: usize) -> Value {
     match value {
         Value::Array(arr) => {
             // Decide strategy based on depth and element "shape"
-            let is_list_of_arrays = arr.iter().all(|v| matches!(v, Value::Array(_)));
+            let row_like = is_mostly_arrays(arr);
             let (min_len, head, tail) = if depth == 0 {
                 (OUTER_MIN_CROP_LEN, OUTER_HEAD, OUTER_TAIL)
-            } else if is_list_of_arrays {
+            } else if row_like {
                 (INNER_MIN_CROP_LEN, ROW_LIST_HEAD, ROW_LIST_TAIL)
             } else {
                 (INNER_MIN_CROP_LEN, SCALAR_LIST_HEAD, SCALAR_LIST_TAIL)
@@ -189,17 +232,36 @@ fn crop_value(value: &Value, depth: usize) -> Value {
             // Trim only *top-level* objects by key count; always recurse into values.
             if depth == 0 && map.len() > MAX_OBJECT_KEYS {
                 let mut trimmed = serde_json::Map::with_capacity(MAX_OBJECT_KEYS + 1);
-                for (k, v) in map.iter().take(MAX_OBJECT_KEYS) {
-                    trimmed.insert(k.clone(), crop_value(v, depth + 1));
+
+                // 1) Insert prioritized keys in order, if present.
+                for k in IMPORTANT_KEYS {
+                    if let Some(v) = map.get(*k) {
+                        if trimmed.len() < MAX_OBJECT_KEYS {
+                            trimmed.insert((*k).to_string(), crop_value(v, depth + 1));
+                        }
+                    }
                 }
-                trimmed.insert(
-                    "...".to_string(),
-                    Value::String(format!("{} more keys", map.len() - MAX_OBJECT_KEYS)),
-                );
+                // 2) Fill the remaining budget with other keys in map order.
+                for (k, v) in map.iter() {
+                    if trimmed.len() >= MAX_OBJECT_KEYS {
+                        break;
+                    }
+                    if !trimmed.contains_key(k) {
+                        trimmed.insert(k.clone(), crop_value(v, depth + 1));
+                    }
+                }
+                // 3) Ellipsis marker with remaining count.
+                if map.len() > trimmed.len() {
+                    trimmed.insert(
+                        "...".to_string(),
+                        Value::String(format!("{} more keys", map.len() - trimmed.len())),
+                    );
+                }
+
                 Value::Object(trimmed)
             } else {
                 let mut new_map = serde_json::Map::with_capacity(map.len());
-                for (k, v) in map {
+                for (k, v) in map.iter() {
                     new_map.insert(k.clone(), crop_value(v, depth + 1));
                 }
                 Value::Object(new_map)
@@ -261,10 +323,12 @@ fn format_message(parts: &[Vec<u8>]) -> String {
 
 fn run_proxy(context: &zmq::Context, config: &Config) -> Result<(), zmq::Error> {
     let xsub_socket = context.socket(zmq::XSUB)?;
+    configure_socket(&xsub_socket)?;
     xsub_socket.bind(&config.network.proxy_xsub_endpoint)?;
     info!("(Proxy) XSUB bound to {}", config.network.proxy_xsub_endpoint);
 
     let xpub_socket = context.socket(zmq::XPUB)?;
+    configure_socket(&xpub_socket)?;
     xpub_socket.bind(&config.network.proxy_xpub_endpoint)?;
     info!("(Proxy) XPUB bound to {}", config.network.proxy_xpub_endpoint);
 
@@ -277,115 +341,104 @@ fn run_proxy(context: &zmq::Context, config: &Config) -> Result<(), zmq::Error> 
 // ------------------------------ Broker ---------------------------------------
 //
 
-fn forward_or_log(src: &zmq::Socket, dst: &zmq::Socket, src_name: &str, dst_name: &str) {
-    match retry(
-        || src.recv_multipart(0),
-        RETRY_ATTEMPTS,
-        Duration::from_millis(RETRY_BACKOFF_MS),
-        &format!("recv {}", src_name),
-    ) {
+fn forward_message(src: &zmq::Socket, dst: &zmq::Socket, src_name: &str, dst_name: &str) {
+    match src.recv_multipart(0) {
         Ok(message) => {
-            debug!(
-                "(Broker) Forwarding {} -> {}: {}",
-                src_name,
-                dst_name,
-                format_message(&message)
-            );
-            if let Err(e) = retry(
-                || dst.send_multipart(&message, 0),
-                RETRY_ATTEMPTS,
-                Duration::from_millis(RETRY_BACKOFF_MS),
-                &format!("send {} -> {}", src_name, dst_name),
-            ) {
-                error!("(Broker) Error forwarding {} -> {}: {}", src_name, dst_name, e);
+            if log::log_enabled!(log::Level::Debug) {
+                debug!(
+                    "(Broker) Forwarding {} -> {}: {}",
+                    src_name,
+                    dst_name,
+                    format_message(&message)
+                );
+            }
+            if let Err(e) = dst.send_multipart(&message, 0) {
+                error!(
+                    "(Broker) Error forwarding {} -> {}: {}",
+                    src_name, dst_name, e
+                );
             }
         }
         Err(e) => error!("(Broker) Error receiving from {}: {}", src_name, e),
     }
 }
 
-fn handle_client_to_client(router: &zmq::Socket) {
-    match retry(
-        || router.recv_multipart(0),
-        RETRY_ATTEMPTS,
-        Duration::from_millis(RETRY_BACKOFF_MS),
-        "recv client_to_client_direct_messaging_router",
-    ) {
+fn route_direct_message(router: &zmq::Socket) {
+    match router.recv_multipart(0) {
         Ok(msg) => {
-            info!(
-                "(Broker) Received from client_to_client_direct_messaging_router: {}",
-                format_message(&msg)
-            );
+            if log::log_enabled!(log::Level::Debug) {
+                debug!(
+                    "(Broker) Received from direct_router: {}",
+                    format_message(&msg)
+                );
+            }
 
             if msg.len() == 3 {
                 let client_id = &msg[0];
                 let empty = &msg[1];
                 let payload = &msg[2];
 
-                if let Err(e) = retry(
-                    || router.send_multipart(&[empty, client_id, payload], 0),
-                    RETRY_ATTEMPTS,
-                    Duration::from_millis(RETRY_BACKOFF_MS),
-                    "send client_to_client_direct_messaging_router",
-                ) {
-                    error!(
-                        "(Broker) Error sending to client_to_client_direct_messaging_router: {}",
-                        e
-                    );
+                if let Err(e) = router.send_multipart(&[empty, client_id, payload], 0) {
+                    error!("(Broker) Error sending to direct_router: {}", e);
                 }
             } else {
                 warn!(
-                    "(Broker) Unexpected client_to_client_direct_messaging_router message ({} frames): {}",
+                    "(Broker) Unexpected direct_router message ({} frames): {}",
                     msg.len(),
                     format_message(&msg)
                 );
             }
         }
-        Err(e) => error!(
-            "(Broker) Error receiving from client_to_client_direct_messaging_router: {}",
-            e
-        ),
+        Err(e) => error!("(Broker) Error receiving from direct_router: {}", e),
     }
 }
 
-fn run_broker(context: &zmq::Context, config: &Config) -> Result<(), zmq::Error> {
+fn run_broker(
+    context: &zmq::Context,
+    config: &Config,
+    shutdown: &Arc<AtomicBool>,
+) -> Result<(), zmq::Error> {
     // (1) ROUTER for direct client<->client messaging
-    let client_to_client_direct_messaging_router = context.socket(zmq::ROUTER)?;
-    client_to_client_direct_messaging_router.bind(&config.network.client_to_client_endpoint)?;
+    let direct_router = context.socket(zmq::ROUTER)?;
+    configure_socket(&direct_router)?;
+    direct_router.bind(&config.network.client_to_client_endpoint)?;
     info!(
-        "(Broker) client_to_client_direct_messaging_router (ROUTER) bound to {}",
+        "(Broker) direct_router (ROUTER) bound to {}",
         config.network.client_to_client_endpoint
     );
 
     // (2) Client-facing ROUTER (frontend)
-    let client_facing_router = context.socket(zmq::ROUTER)?;
-    client_facing_router.bind(&config.network.client_facing_endpoint)?;
+    let client_router = context.socket(zmq::ROUTER)?;
+    configure_socket(&client_router)?;
+    client_router.bind(&config.network.client_facing_endpoint)?;
     info!(
-        "(Broker) client_facing_router (ROUTER) bound to {}",
+        "(Broker) client_router (ROUTER) bound to {}",
         config.network.client_facing_endpoint
     );
 
     // (3) Worker-facing DEALER (backend)
-    let worker_facing_dealer = context.socket(zmq::DEALER)?;
-    worker_facing_dealer.bind(&config.network.worker_facing_endpoint)?;
+    let worker_dealer = context.socket(zmq::DEALER)?;
+    configure_socket(&worker_dealer)?;
+    worker_dealer.bind(&config.network.worker_facing_endpoint)?;
     info!(
-        "(Broker) worker_facing_dealer (DEALER) bound to {}",
+        "(Broker) worker_dealer (DEALER) bound to {}",
         config.network.worker_facing_endpoint
     );
 
     info!("(Broker) Broker loop started. Polling for messages...");
 
     let mut poll_items = [
-        client_to_client_direct_messaging_router.as_poll_item(zmq::POLLIN),
-        client_facing_router.as_poll_item(zmq::POLLIN),
-        worker_facing_dealer.as_poll_item(zmq::POLLIN),
+        direct_router.as_poll_item(zmq::POLLIN),
+        client_router.as_poll_item(zmq::POLLIN),
+        worker_dealer.as_poll_item(zmq::POLLIN),
     ];
 
-    const IDX_CLIENT_TO_CLIENT_DIRECT_MESSAGING_ROUTER: usize = 0;
-    const IDX_CLIENT_FACING_ROUTER: usize = 1;
-    const IDX_WORKER_FACING_DEALER: usize = 2;
-
     loop {
+        if shutdown.load(Ordering::SeqCst) {
+            info!("(Broker) Shutdown requested...");
+            return Ok(());
+        }
+
         zmq::poll(&mut poll_items, POLL_TIMEOUT_MS)?;
 
         for idx in 0..poll_items.len() {
@@ -393,20 +446,18 @@ fn run_broker(context: &zmq::Context, config: &Config) -> Result<(), zmq::Error>
                 continue;
             }
             match idx {
-                IDX_CLIENT_TO_CLIENT_DIRECT_MESSAGING_ROUTER => {
-                    handle_client_to_client(&client_to_client_direct_messaging_router)
-                }
-                IDX_CLIENT_FACING_ROUTER => forward_or_log(
-                    &client_facing_router,
-                    &worker_facing_dealer,
-                    "client_facing_router",
-                    "worker_facing_dealer",
+                IDX_DIRECT_ROUTER => route_direct_message(&direct_router),
+                IDX_CLIENT_ROUTER => forward_message(
+                    &client_router,
+                    &worker_dealer,
+                    "client_router",
+                    "worker_dealer",
                 ),
-                IDX_WORKER_FACING_DEALER => forward_or_log(
-                    &worker_facing_dealer,
-                    &client_facing_router,
-                    "worker_facing_dealer",
-                    "client_facing_router",
+                IDX_WORKER_DEALER => forward_message(
+                    &worker_dealer,
+                    &client_router,
+                    "worker_dealer",
+                    "client_router",
                 ),
                 _ => unreachable!("invalid poll index"),
             }
@@ -420,39 +471,106 @@ fn run_broker(context: &zmq::Context, config: &Config) -> Result<(), zmq::Error>
 
 fn main() {
     // 1) Load configuration and initialize logging
-    let config = load_config().expect("Failed to load configuration");
+    let config = load_config().unwrap_or_else(|e| {
+        eprintln!("Config error: {}. Using defaults.", e);
+        Config::default()
+    });
     if let Err(e) = setup_logger(&config) {
         eprintln!("Failed to initialize logger: {}", e);
         std::process::exit(1);
     }
     info!("ZMQ Combined Proxy & Broker (Rust Version) - Starting...");
 
-    // 2) Create a global ZMQ context
+    // 2) Set up signal handling for graceful shutdown
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_handler = Arc::clone(&shutdown);
+    ctrlc::set_handler(move || {
+        info!("Shutdown signal received...");
+        shutdown_handler.store(true, Ordering::SeqCst);
+    })
+    .expect("Error setting Ctrl-C handler");
+
+    // 3) Create a global ZMQ context
     let context = zmq::Context::new();
 
-    // 3) Start XSUB/XPUB proxy in a background thread
+    // 4) Start XSUB/XPUB proxy in a background thread
     let ctx_for_proxy = context.clone();
     let config_for_proxy = config.clone();
-    let proxy_thread = thread::spawn(move || loop {
-        match run_proxy(&ctx_for_proxy, &config_for_proxy) {
-            Ok(_) => {
-                info!("(Proxy) Stopped without error. Exiting proxy thread...");
-                break;
-            }
-            Err(e) => {
-                error!("(Proxy) Encountered an error: {}", e);
-                thread::sleep(Duration::from_millis(RETRY_BACKOFF_MS));
-                warn!("(Proxy) Retrying XSUB/XPUB proxy...");
+    let shutdown_proxy = Arc::clone(&shutdown);
+    let proxy_thread = thread::spawn(move || {
+        while !shutdown_proxy.load(Ordering::SeqCst) {
+            match run_proxy(&ctx_for_proxy, &config_for_proxy) {
+                Ok(_) => break,
+                Err(_) if shutdown_proxy.load(Ordering::SeqCst) => break,
+                Err(e) => {
+                    error!("(Proxy) Error: {}", e);
+                    thread::sleep(Duration::from_millis(RETRY_BACKOFF_MS));
+                }
             }
         }
     });
 
-    // 4) Run the broker loop (blocks)
-    if let Err(e) = run_broker(&context, &config) {
-        error!("(Broker) Encountered an error: {}", e);
+    // 5) Run the broker loop with auto-recovery
+    let shutdown_broker = Arc::clone(&shutdown);
+    while !shutdown_broker.load(Ordering::SeqCst) {
+        match run_broker(&context, &config, &shutdown_broker) {
+            Ok(_) => break,
+            Err(_) if shutdown_broker.load(Ordering::SeqCst) => break,
+            Err(e) => {
+                error!("(Broker) Error: {}", e);
+                thread::sleep(Duration::from_millis(RETRY_BACKOFF_MS));
+            }
+        }
     }
 
-    // 5) Join the proxy thread on exit
+    // 6) Join the proxy thread on exit
     let _ = proxy_thread.join();
-    info!("(Main) Exiting.");
+    info!("(Main) Graceful shutdown complete.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn no_crop_small_top_level_triplet() {
+        // ["qb-python", "rustcharts", ["ok", {...}]]
+        let v = json!(["qb-python", "rustcharts", ["ok", { "x": 1 }]]);
+        let s = format_json_pretty(&v);
+        assert!(
+            !s.contains("... ("),
+            "should not crop small outer arrays; got: {s}"
+        );
+    }
+
+    #[test]
+    fn crop_large_row_list_first_and_last() {
+        // data: many rows -> expect 1 head, ellipsis, 1 tail
+        let mut rows: Vec<Value> = Vec::new();
+        for i in 0..35 {
+            rows.push(json!([i, i + 1, i + 2, i + 3, i + 4, i + 5]));
+        }
+        let v = json!({ "data": rows });
+        let s = format_json_pretty(&v);
+        assert!(
+            s.matches("... (").count() >= 1,
+            "expected an ellipsis for large data arrays"
+        );
+        assert!(s.contains("[0, 1, 2, 3, 4, 5]"));
+        assert!(s.contains("[34, 35, 36, 37, 38, 39]"));
+    }
+
+    #[test]
+    fn crop_large_scalar_list_show_head_tail() {
+        let colors: Vec<Value> = (0..64)
+            .map(|i| Value::String(format!("#{:06X}", i)))
+            .collect();
+        let v = json!({ "candle_colors": colors });
+        let s = format_json_pretty(&v);
+        assert!(
+            s.matches("... (").count() >= 1,
+            "expected an ellipsis for large scalar arrays"
+        );
+    }
 }
