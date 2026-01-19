@@ -1,4 +1,5 @@
 use std::fs;
+use std::panic;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -7,8 +8,6 @@ use std::time::Duration;
 use log::{debug, error, info, warn};
 use serde::Deserialize;
 use serde_json::{self, Value};
-use toml;
-use zmq;
 
 //
 // ------------------------------- Constants -----------------------------------
@@ -52,8 +51,9 @@ const IMPORTANT_KEYS: &[&str] = &[
 // ------------------------------- Config --------------------------------------
 //
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Clone, Default)]
 struct Config {
+    #[serde(default)]
     logging: LoggingConfig,
     #[serde(default)]
     network: NetworkConfig,
@@ -68,15 +68,6 @@ impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
             level: "info".to_string(),
-        }
-    }
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            logging: LoggingConfig::default(),
-            network: NetworkConfig::default(),
         }
     }
 }
@@ -171,8 +162,8 @@ fn is_mostly_arrays(arr: &[Value]) -> bool {
     if len == 0 {
         return false;
     }
-    let sample_n = len.min(32).max(1);
-    let step = (len + sample_n - 1) / sample_n; // ceil(len/sample_n)
+    let sample_n = len.clamp(1, 32);
+    let step = len.div_ceil(sample_n);
     let mut arrays = 0usize;
     let mut taken = 0usize;
     let mut i = 0usize;
@@ -359,6 +350,9 @@ fn forward_message(src: &zmq::Socket, dst: &zmq::Socket, src_name: &str, dst_nam
                 );
             }
         }
+        Err(zmq::Error::EINTR) => {
+            // Interrupted by signal, not an error
+        }
         Err(e) => error!("(Broker) Error receiving from {}: {}", src_name, e),
     }
 }
@@ -378,7 +372,7 @@ fn route_direct_message(router: &zmq::Socket) {
                 let empty = &msg[1];
                 let payload = &msg[2];
 
-                if let Err(e) = router.send_multipart(&[empty, client_id, payload], 0) {
+                if let Err(e) = router.send_multipart([empty, client_id, payload], 0) {
                     error!("(Broker) Error sending to direct_router: {}", e);
                 }
             } else {
@@ -388,6 +382,9 @@ fn route_direct_message(router: &zmq::Socket) {
                     format_message(&msg)
                 );
             }
+        }
+        Err(zmq::Error::EINTR) => {
+            // Interrupted by signal, not an error
         }
         Err(e) => error!("(Broker) Error receiving from direct_router: {}", e),
     }
@@ -439,10 +436,14 @@ fn run_broker(
             return Ok(());
         }
 
-        zmq::poll(&mut poll_items, POLL_TIMEOUT_MS)?;
+        match zmq::poll(&mut poll_items, POLL_TIMEOUT_MS) {
+            Ok(_) => {}
+            Err(zmq::Error::EINTR) => continue, // Signal interrupted, just retry
+            Err(e) => return Err(e),
+        }
 
-        for idx in 0..poll_items.len() {
-            if !poll_items[idx].is_readable() {
+        for (idx, poll_item) in poll_items.iter().enumerate() {
+            if !poll_item.is_readable() {
                 continue;
             }
             match idx {
@@ -459,7 +460,9 @@ fn run_broker(
                     "worker_dealer",
                     "client_router",
                 ),
-                _ => unreachable!("invalid poll index"),
+                unexpected => {
+                    error!("(Broker) Unexpected poll index {}, skipping", unexpected);
+                }
             }
         }
     }
@@ -470,6 +473,17 @@ fn run_broker(
 //
 
 fn main() {
+    let result = panic::catch_unwind(|| {
+        run_main();
+    });
+
+    if let Err(e) = result {
+        eprintln!("FATAL: Panic caught: {:?}", e);
+        std::process::exit(1);
+    }
+}
+
+fn run_main() {
     // 1) Load configuration and initialize logging
     let config = load_config().unwrap_or_else(|e| {
         eprintln!("Config error: {}. Using defaults.", e);
@@ -484,11 +498,12 @@ fn main() {
     // 2) Set up signal handling for graceful shutdown
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_handler = Arc::clone(&shutdown);
-    ctrlc::set_handler(move || {
+    if let Err(e) = ctrlc::set_handler(move || {
         info!("Shutdown signal received...");
         shutdown_handler.store(true, Ordering::SeqCst);
-    })
-    .expect("Error setting Ctrl-C handler");
+    }) {
+        error!("Failed to set Ctrl-C handler: {}. Graceful shutdown via Ctrl-C disabled.", e);
+    }
 
     // 3) Create a global ZMQ context
     let context = zmq::Context::new();
@@ -497,18 +512,28 @@ fn main() {
     let ctx_for_proxy = context.clone();
     let config_for_proxy = config.clone();
     let shutdown_proxy = Arc::clone(&shutdown);
-    let proxy_thread = thread::spawn(move || {
-        while !shutdown_proxy.load(Ordering::SeqCst) {
-            match run_proxy(&ctx_for_proxy, &config_for_proxy) {
-                Ok(_) => break,
-                Err(_) if shutdown_proxy.load(Ordering::SeqCst) => break,
-                Err(e) => {
-                    error!("(Proxy) Error: {}", e);
-                    thread::sleep(Duration::from_millis(RETRY_BACKOFF_MS));
+    let proxy_thread = thread::Builder::new()
+        .name("proxy-thread".to_string())
+        .spawn(move || {
+            while !shutdown_proxy.load(Ordering::SeqCst) {
+                match run_proxy(&ctx_for_proxy, &config_for_proxy) {
+                    Ok(_) => break,
+                    Err(_) if shutdown_proxy.load(Ordering::SeqCst) => break,
+                    Err(e) => {
+                        error!("(Proxy) Error: {}", e);
+                        thread::sleep(Duration::from_millis(RETRY_BACKOFF_MS));
+                    }
                 }
             }
+        });
+
+    let proxy_handle = match proxy_thread {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            error!("(Main) Failed to spawn proxy thread: {}. Running without proxy.", e);
+            None
         }
-    });
+    };
 
     // 5) Run the broker loop with auto-recovery
     let shutdown_broker = Arc::clone(&shutdown);
@@ -524,7 +549,9 @@ fn main() {
     }
 
     // 6) Join the proxy thread on exit
-    let _ = proxy_thread.join();
+    if let Some(handle) = proxy_handle {
+        let _ = handle.join();
+    }
     info!("(Main) Graceful shutdown complete.");
 }
 
