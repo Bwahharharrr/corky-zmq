@@ -25,6 +25,8 @@ const DEFAULT_CLIENT_TO_CLIENT_ENDPOINT: &str = "tcp://*:6565";
 const DEFAULT_CLIENT_FACING_ENDPOINT: &str = "tcp://*:5559";
 const DEFAULT_WORKER_FACING_ENDPOINT: &str = "tcp://*:5560";
 
+const PROXY_CONTROL_ENDPOINT: &str = "inproc://proxy-control";
+
 // Poll index constants for broker
 const IDX_DIRECT_ROUTER: usize = 0;
 const IDX_CLIENT_ROUTER: usize = 1;
@@ -312,20 +314,27 @@ fn format_message(parts: &[Vec<u8>]) -> String {
 // ------------------------------ Proxy ----------------------------------------
 //
 
-fn run_proxy(context: &zmq::Context, config: &Config) -> Result<(), zmq::Error> {
-    let xsub_socket = context.socket(zmq::XSUB)?;
+fn run_proxy(
+    context: &zmq::Context,
+    config: &Config,
+    control_endpoint: &str,
+) -> Result<(), zmq::Error> {
+    let mut xsub_socket = context.socket(zmq::XSUB)?;
     configure_socket(&xsub_socket)?;
     xsub_socket.bind(&config.network.proxy_xsub_endpoint)?;
     info!("(Proxy) XSUB bound to {}", config.network.proxy_xsub_endpoint);
 
-    let xpub_socket = context.socket(zmq::XPUB)?;
+    let mut xpub_socket = context.socket(zmq::XPUB)?;
     configure_socket(&xpub_socket)?;
     xpub_socket.bind(&config.network.proxy_xpub_endpoint)?;
     info!("(Proxy) XPUB bound to {}", config.network.proxy_xpub_endpoint);
 
+    // Control socket for steerable proxy
+    let mut control_socket = context.socket(zmq::PAIR)?;
+    control_socket.bind(control_endpoint)?;
+
     info!("(Proxy) Starting XSUB/XPUB forwarder...");
-    zmq::proxy(&xpub_socket, &xsub_socket)?;
-    Ok(())
+    zmq::proxy_steerable(&mut xpub_socket, &mut xsub_socket, &mut control_socket)
 }
 
 //
@@ -512,11 +521,12 @@ fn run_main() {
     let ctx_for_proxy = context.clone();
     let config_for_proxy = config.clone();
     let shutdown_proxy = Arc::clone(&shutdown);
+    let control_endpoint = PROXY_CONTROL_ENDPOINT.to_string();
     let proxy_thread = thread::Builder::new()
         .name("proxy-thread".to_string())
         .spawn(move || {
             while !shutdown_proxy.load(Ordering::SeqCst) {
-                match run_proxy(&ctx_for_proxy, &config_for_proxy) {
+                match run_proxy(&ctx_for_proxy, &config_for_proxy, &control_endpoint) {
                     Ok(_) => break,
                     Err(_) if shutdown_proxy.load(Ordering::SeqCst) => break,
                     Err(e) => {
@@ -548,8 +558,23 @@ fn run_main() {
         }
     }
 
-    // 6) Join the proxy thread on exit
+    // 6) Signal proxy thread to terminate and join
     if let Some(handle) = proxy_handle {
+        // Send TERMINATE command to steerable proxy
+        match context.socket(zmq::PAIR) {
+            Ok(control_socket) => {
+                if let Err(e) = control_socket.connect(PROXY_CONTROL_ENDPOINT) {
+                    warn!("(Main) Failed to connect to proxy control socket: {}", e);
+                } else if let Err(e) = control_socket.send("TERMINATE", 0) {
+                    warn!("(Main) Failed to send TERMINATE to proxy: {}", e);
+                } else {
+                    info!("(Main) Sent TERMINATE to proxy");
+                }
+            }
+            Err(e) => {
+                warn!("(Main) Failed to create proxy control socket: {}", e);
+            }
+        }
         let _ = handle.join();
     }
     info!("(Main) Graceful shutdown complete.");
