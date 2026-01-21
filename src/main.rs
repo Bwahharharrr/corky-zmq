@@ -30,7 +30,7 @@ const PROXY_CONTROL_ENDPOINT: &str = "inproc://proxy-control";
 // Poll index constants for broker
 const IDX_DIRECT_ROUTER: usize = 0;
 const IDX_CLIENT_ROUTER: usize = 1;
-const IDX_WORKER_DEALER: usize = 2;
+const IDX_WORKER_ROUTER: usize = 2;
 
 // Cropping controls (arrays)
 const MAX_DEPTH: usize = 2;                 // limit recursion for performance
@@ -366,6 +366,51 @@ fn forward_message(src: &zmq::Socket, dst: &zmq::Socket, src_name: &str, dst_nam
     }
 }
 
+fn route_worker_message(worker_router: &zmq::Socket, client_router: &zmq::Socket) {
+    match worker_router.recv_multipart(0) {
+        Ok(message) => {
+            if message.len() < 2 {
+                warn!(
+                    "(Broker) Worker message too short ({} frames): {}",
+                    message.len(),
+                    format_message(&message)
+                );
+                return;
+            }
+
+            // First frame is the worker's identity (added by ROUTER)
+            let worker_id = &message[0];
+            let payload = &message[1..];
+
+            if log::log_enabled!(log::Level::Debug) {
+                debug!(
+                    "(Broker) Received from worker_router: {}",
+                    format_message(&message)
+                );
+            }
+
+            // Echo back to the worker (for testing/acknowledgment)
+            let mut echo_msg = vec![worker_id.clone()];
+            echo_msg.extend_from_slice(payload);
+            debug!("(Broker) Echoing back to worker: {}", format_message(&echo_msg));
+            if let Err(e) = worker_router.send_multipart(&echo_msg, 0) {
+                error!("(Broker) Error echoing to worker: {}", e);
+            }
+
+            // Also try to forward to client_router if there's a valid routing identity
+            if payload.len() >= 2 {
+                if let Err(e) = client_router.send_multipart(payload, zmq::DONTWAIT) {
+                    debug!("(Broker) Cannot forward to client: {}", e);
+                }
+            }
+        }
+        Err(zmq::Error::EINTR) => {
+            // Interrupted by signal, not an error
+        }
+        Err(e) => error!("(Broker) Error receiving from worker_router: {}", e),
+    }
+}
+
 fn route_direct_message(router: &zmq::Socket) {
     match router.recv_multipart(0) {
         Ok(msg) => {
@@ -416,18 +461,19 @@ fn run_broker(
     // (2) Client-facing ROUTER (frontend)
     let client_router = context.socket(zmq::ROUTER)?;
     configure_socket(&client_router)?;
+    client_router.set_router_mandatory(true)?; // Fail if routing identity doesn't exist
     client_router.bind(&config.network.client_facing_endpoint)?;
     info!(
         "(Broker) client_router (ROUTER) bound to {}",
         config.network.client_facing_endpoint
     );
 
-    // (3) Worker-facing DEALER (backend)
-    let worker_dealer = context.socket(zmq::DEALER)?;
-    configure_socket(&worker_dealer)?;
-    worker_dealer.bind(&config.network.worker_facing_endpoint)?;
+    // (3) Worker-facing ROUTER (backend)
+    let worker_router = context.socket(zmq::ROUTER)?;
+    configure_socket(&worker_router)?;
+    worker_router.bind(&config.network.worker_facing_endpoint)?;
     info!(
-        "(Broker) worker_dealer (DEALER) bound to {}",
+        "(Broker) worker_router (ROUTER) bound to {}",
         config.network.worker_facing_endpoint
     );
 
@@ -436,7 +482,7 @@ fn run_broker(
     let mut poll_items = [
         direct_router.as_poll_item(zmq::POLLIN),
         client_router.as_poll_item(zmq::POLLIN),
-        worker_dealer.as_poll_item(zmq::POLLIN),
+        worker_router.as_poll_item(zmq::POLLIN),
     ];
 
     loop {
@@ -459,16 +505,11 @@ fn run_broker(
                 IDX_DIRECT_ROUTER => route_direct_message(&direct_router),
                 IDX_CLIENT_ROUTER => forward_message(
                     &client_router,
-                    &worker_dealer,
+                    &worker_router,
                     "client_router",
-                    "worker_dealer",
+                    "worker_router",
                 ),
-                IDX_WORKER_DEALER => forward_message(
-                    &worker_dealer,
-                    &client_router,
-                    "worker_dealer",
-                    "client_router",
-                ),
+                IDX_WORKER_ROUTER => route_worker_message(&worker_router, &client_router),
                 unexpected => {
                     error!("(Broker) Unexpected poll index {}, skipping", unexpected);
                 }
