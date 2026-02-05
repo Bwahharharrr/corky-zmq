@@ -376,10 +376,21 @@ fn forward_message(src: &zmq::Socket, dst: &zmq::Socket, src_name: &str, dst_nam
 }
 
 fn route_worker_message(worker_router: &zmq::Socket, client_router: &zmq::Socket) {
-    // DEALER socket: no identity frame prepended on receive.
-    // Worker messages arrive as raw multipart from the worker.
     match worker_router.recv_multipart(0) {
         Ok(message) => {
+            if message.len() < 2 {
+                warn!(
+                    "(Broker) Worker message too short ({} frames): {}",
+                    message.len(),
+                    format_message(&message)
+                );
+                return;
+            }
+
+            // First frame is the worker's identity (added by ROUTER)
+            let worker_id = &message[0];
+            let payload = &message[1..];
+
             if log::log_enabled!(log::Level::Debug) {
                 debug!(
                     "(Broker) Received from worker_router: {}",
@@ -387,9 +398,23 @@ fn route_worker_message(worker_router: &zmq::Socket, client_router: &zmq::Socket
                 );
             }
 
-            // Forward to client_router if there's a valid routing identity (>= 2 frames)
-            if message.len() >= 2 {
-                match client_router.send_multipart(&message, zmq::DONTWAIT) {
+            // Echo back to the worker (for testing/acknowledgment)
+            let mut echo_msg = vec![worker_id.clone()];
+            echo_msg.extend_from_slice(payload);
+            debug!("(Broker) Echoing back to worker: {}", format_message(&echo_msg));
+            match worker_router.send_multipart(&echo_msg, zmq::DONTWAIT) {
+                Ok(_) => {}
+                Err(zmq::Error::EAGAIN) => {
+                    warn!("(Broker) Send would block, dropping message");
+                }
+                Err(e) => {
+                    error!("(Broker) Error echoing to worker: {}", e);
+                }
+            }
+
+            // Forward to client_router if there's a valid routing identity
+            if payload.len() >= 2 {
+                match client_router.send_multipart(payload, zmq::DONTWAIT) {
                     Ok(_) => {}
                     Err(zmq::Error::EAGAIN) => {
                         warn!("(Broker) Send would block, dropping message");
@@ -398,12 +423,6 @@ fn route_worker_message(worker_router: &zmq::Socket, client_router: &zmq::Socket
                         debug!("(Broker) Cannot forward to client: {}", e);
                     }
                 }
-            } else {
-                warn!(
-                    "(Broker) Worker message too short ({} frames): {}",
-                    message.len(),
-                    format_message(&message)
-                );
             }
         }
         Err(zmq::Error::EINTR) => {
@@ -478,12 +497,12 @@ fn run_broker(
         config.network.client_facing_endpoint
     );
 
-    // (3) Worker-facing DEALER (backend)
-    let worker_router = context.socket(zmq::DEALER)?;
+    // (3) Worker-facing ROUTER (backend)
+    let worker_router = context.socket(zmq::ROUTER)?;
     configure_socket(&worker_router)?;
     worker_router.bind(&config.network.worker_facing_endpoint)?;
     info!(
-        "(Broker) worker_router (DEALER) bound to {}",
+        "(Broker) worker_router (ROUTER) bound to {}",
         config.network.worker_facing_endpoint
     );
 
