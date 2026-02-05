@@ -14,7 +14,9 @@ use serde_json::{self, Value};
 //
 
 const POLL_TIMEOUT_MS: i64 = 10; // poll timeout for low latency
-const RETRY_BACKOFF_MS: u64 = 3000; // backoff between connection retries (ms)
+const RETRY_BACKOFF_MS: u64 = 3000; // initial backoff between connection retries (ms)
+const MAX_RETRIES: u32 = 10; // maximum retry attempts before giving up
+const MAX_BACKOFF_MS: u64 = 30_000; // maximum backoff interval (ms)
 
 const BYTES_PREVIEW_LEN: usize = 20; // byte preview length for non-UTF8 parts
 const MAX_OBJECT_KEYS: usize = 10; // keys to show when trimming top-level objects
@@ -331,6 +333,7 @@ fn run_proxy(
 
     // Control socket for steerable proxy
     let mut control_socket = context.socket(zmq::PAIR)?;
+    control_socket.set_linger(0)?;
     control_socket.bind(control_endpoint)?;
 
     info!("(Proxy) Starting XSUB/XPUB forwarder...");
@@ -352,11 +355,17 @@ fn forward_message(src: &zmq::Socket, dst: &zmq::Socket, src_name: &str, dst_nam
                     format_message(&message)
                 );
             }
-            if let Err(e) = dst.send_multipart(&message, 0) {
-                error!(
-                    "(Broker) Error forwarding {} -> {}: {}",
-                    src_name, dst_name, e
-                );
+            match dst.send_multipart(&message, zmq::DONTWAIT) {
+                Ok(_) => {}
+                Err(zmq::Error::EAGAIN) => {
+                    warn!("(Broker) Send would block, dropping message");
+                }
+                Err(e) => {
+                    error!(
+                        "(Broker) Error forwarding {} -> {}: {}",
+                        src_name, dst_name, e
+                    );
+                }
             }
         }
         Err(zmq::Error::EINTR) => {
@@ -367,21 +376,10 @@ fn forward_message(src: &zmq::Socket, dst: &zmq::Socket, src_name: &str, dst_nam
 }
 
 fn route_worker_message(worker_router: &zmq::Socket, client_router: &zmq::Socket) {
+    // DEALER socket: no identity frame prepended on receive.
+    // Worker messages arrive as raw multipart from the worker.
     match worker_router.recv_multipart(0) {
         Ok(message) => {
-            if message.len() < 2 {
-                warn!(
-                    "(Broker) Worker message too short ({} frames): {}",
-                    message.len(),
-                    format_message(&message)
-                );
-                return;
-            }
-
-            // First frame is the worker's identity (added by ROUTER)
-            let worker_id = &message[0];
-            let payload = &message[1..];
-
             if log::log_enabled!(log::Level::Debug) {
                 debug!(
                     "(Broker) Received from worker_router: {}",
@@ -389,19 +387,23 @@ fn route_worker_message(worker_router: &zmq::Socket, client_router: &zmq::Socket
                 );
             }
 
-            // Echo back to the worker (for testing/acknowledgment)
-            let mut echo_msg = vec![worker_id.clone()];
-            echo_msg.extend_from_slice(payload);
-            debug!("(Broker) Echoing back to worker: {}", format_message(&echo_msg));
-            if let Err(e) = worker_router.send_multipart(&echo_msg, 0) {
-                error!("(Broker) Error echoing to worker: {}", e);
-            }
-
-            // Also try to forward to client_router if there's a valid routing identity
-            if payload.len() >= 2 {
-                if let Err(e) = client_router.send_multipart(payload, zmq::DONTWAIT) {
-                    debug!("(Broker) Cannot forward to client: {}", e);
+            // Forward to client_router if there's a valid routing identity (>= 2 frames)
+            if message.len() >= 2 {
+                match client_router.send_multipart(&message, zmq::DONTWAIT) {
+                    Ok(_) => {}
+                    Err(zmq::Error::EAGAIN) => {
+                        warn!("(Broker) Send would block, dropping message");
+                    }
+                    Err(e) => {
+                        debug!("(Broker) Cannot forward to client: {}", e);
+                    }
                 }
+            } else {
+                warn!(
+                    "(Broker) Worker message too short ({} frames): {}",
+                    message.len(),
+                    format_message(&message)
+                );
             }
         }
         Err(zmq::Error::EINTR) => {
@@ -422,12 +424,20 @@ fn route_direct_message(router: &zmq::Socket) {
             }
 
             if msg.len() == 3 {
-                let client_id = &msg[0];
-                let empty = &msg[1];
+                // Protocol: client sends [target_id, payload] via DEALER.
+                // ROUTER prepends sender identity → [sender_id, target_id, payload].
+                let sender_id = &msg[0];
+                let target_id = &msg[1];
                 let payload = &msg[2];
 
-                if let Err(e) = router.send_multipart([empty, client_id, payload], 0) {
-                    error!("(Broker) Error sending to direct_router: {}", e);
+                match router.send_multipart([target_id, sender_id, payload], zmq::DONTWAIT) {
+                    Ok(_) => {}
+                    Err(zmq::Error::EAGAIN) => {
+                        warn!("(Broker) Send would block, dropping message");
+                    }
+                    Err(e) => {
+                        error!("(Broker) Error sending to direct_router: {}", e);
+                    }
                 }
             } else {
                 warn!(
@@ -468,12 +478,12 @@ fn run_broker(
         config.network.client_facing_endpoint
     );
 
-    // (3) Worker-facing ROUTER (backend)
-    let worker_router = context.socket(zmq::ROUTER)?;
+    // (3) Worker-facing DEALER (backend)
+    let worker_router = context.socket(zmq::DEALER)?;
     configure_socket(&worker_router)?;
     worker_router.bind(&config.network.worker_facing_endpoint)?;
     info!(
-        "(Broker) worker_router (ROUTER) bound to {}",
+        "(Broker) worker_router (DEALER) bound to {}",
         config.network.worker_facing_endpoint
     );
 
@@ -566,13 +576,21 @@ fn run_main() {
     let proxy_thread = thread::Builder::new()
         .name("proxy-thread".to_string())
         .spawn(move || {
+            let mut retries = 0u32;
             while !shutdown_proxy.load(Ordering::SeqCst) {
                 match run_proxy(&ctx_for_proxy, &config_for_proxy, &control_endpoint) {
                     Ok(_) => break,
                     Err(_) if shutdown_proxy.load(Ordering::SeqCst) => break,
                     Err(e) => {
-                        error!("(Proxy) Error: {}", e);
-                        thread::sleep(Duration::from_millis(RETRY_BACKOFF_MS));
+                        retries += 1;
+                        error!("(Proxy) Error: {} (attempt {}/{})", e, retries, MAX_RETRIES);
+                        if retries >= MAX_RETRIES {
+                            error!("(Proxy) Exceeded max retries, shutting down");
+                            shutdown_proxy.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                        let backoff = (RETRY_BACKOFF_MS * 2u64.pow(retries - 1)).min(MAX_BACKOFF_MS);
+                        thread::sleep(Duration::from_millis(backoff));
                     }
                 }
             }
@@ -588,13 +606,21 @@ fn run_main() {
 
     // 5) Run the broker loop with auto-recovery
     let shutdown_broker = Arc::clone(&shutdown);
+    let mut retries = 0u32;
     while !shutdown_broker.load(Ordering::SeqCst) {
         match run_broker(&context, &config, &shutdown_broker) {
             Ok(_) => break,
             Err(_) if shutdown_broker.load(Ordering::SeqCst) => break,
             Err(e) => {
-                error!("(Broker) Error: {}", e);
-                thread::sleep(Duration::from_millis(RETRY_BACKOFF_MS));
+                retries += 1;
+                error!("(Broker) Error: {} (attempt {}/{})", e, retries, MAX_RETRIES);
+                if retries >= MAX_RETRIES {
+                    error!("(Broker) Exceeded max retries, shutting down");
+                    shutdown.store(true, Ordering::SeqCst);
+                    break;
+                }
+                let backoff = (RETRY_BACKOFF_MS * 2u64.pow(retries - 1)).min(MAX_BACKOFF_MS);
+                thread::sleep(Duration::from_millis(backoff));
             }
         }
     }
@@ -604,6 +630,7 @@ fn run_main() {
         // Send TERMINATE command to steerable proxy
         match context.socket(zmq::PAIR) {
             Ok(control_socket) => {
+                let _ = control_socket.set_linger(0);
                 if let Err(e) = control_socket.connect(PROXY_CONTROL_ENDPOINT) {
                     warn!("(Main) Failed to connect to proxy control socket: {}", e);
                 } else if let Err(e) = control_socket.send("TERMINATE", 0) {
@@ -616,7 +643,21 @@ fn run_main() {
                 warn!("(Main) Failed to create proxy control socket: {}", e);
             }
         }
-        let _ = handle.join();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if handle.is_finished() {
+                match handle.join() {
+                    Ok(_) => info!("(Main) Proxy thread exited cleanly"),
+                    Err(e) => error!("(Main) Proxy thread panicked: {:?}", e),
+                }
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                warn!("(Main) Proxy thread did not exit within 5s, abandoning join");
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
     }
     info!("(Main) Graceful shutdown complete.");
 }
