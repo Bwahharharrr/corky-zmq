@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use log::{debug, error, info, warn};
+use log::{debug, error, info, warn, Level, LevelFilter, Metadata, Record};
 use serde::Deserialize;
 use serde_json::{self, Value};
 
@@ -124,20 +124,88 @@ fn load_config() -> Result<Config, String> {
 //
 
 fn setup_logger(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
-    // Prefer RUST_LOG; otherwise fall back to config.logging.level.
-    let mut builder = env_logger::Builder::from_env(env_logger::Env::default());
-    if std::env::var("RUST_LOG").is_err() {
-        let level = match config.logging.level.to_lowercase().as_str() {
-            "trace" => log::LevelFilter::Trace,
-            "debug" => log::LevelFilter::Debug,
-            "info" => log::LevelFilter::Info,
-            "warn" => log::LevelFilter::Warn,
-            "error" => log::LevelFilter::Error,
-            _ => log::LevelFilter::Info,
-        };
-        builder.filter_level(level);
+    struct CorkyLogger {
+        max_level: LevelFilter,
     }
-    builder.init();
+
+    impl log::Log for CorkyLogger {
+        fn enabled(&self, metadata: &Metadata) -> bool {
+            metadata.level() <= self.max_level
+        }
+
+        fn log(&self, record: &Record) {
+            if !self.enabled(record.metadata()) {
+                return;
+            }
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let secs = now.as_secs() % 86400;
+            let h = secs / 3600;
+            let m = (secs % 3600) / 60;
+            let s = secs % 60;
+            let timestamp = format!("{:02}:{:02}:{:02}", h, m, s);
+
+            let msg = record.args().to_string();
+
+            const RESET: &str = "\x1b[0m";
+            const GRAY: &str = "\x1b[90m";
+            const RED: &str = "\x1b[31m";
+            const YELLOW: &str = "\x1b[33m";
+            const CYAN: &str = "\x1b[36m";
+            const GREEN: &str = "\x1b[32m";
+            const BLUE: &str = "\x1b[34m";
+
+            let (color, prefix) = match record.level() {
+                Level::Error => (RED, "ERROR"),
+                Level::Warn => (YELLOW, "WARN "),
+                Level::Info => {
+                    if msg.contains("Starting") || msg.contains("started") {
+                        (GREEN, "START")
+                    } else if msg.contains("Shutdown") || msg.contains("shutdown") || msg.contains("TERMINATE") {
+                        (BLUE, "STOP ")
+                    } else if msg.contains("bound to") || msg.contains("Broker loop started") {
+                        (CYAN, "BIND ")
+                    } else if msg.contains("Forwarding") || msg.contains("Received from") {
+                        (CYAN, "MSG  ")
+                    } else {
+                        (GRAY, "INFO ")
+                    }
+                }
+                Level::Debug => (GRAY, "DEBUG"),
+                Level::Trace => (GRAY, "TRACE"),
+            };
+
+            println!("{}{} [{}] {}{}", color, timestamp, prefix, msg, RESET);
+        }
+
+        fn flush(&self) {}
+    }
+
+    let level = if std::env::var("RUST_LOG").is_ok() {
+        // Respect RUST_LOG if set
+        match std::env::var("RUST_LOG").unwrap_or_default().to_lowercase().as_str() {
+            "trace" => LevelFilter::Trace,
+            "debug" => LevelFilter::Debug,
+            "info" => LevelFilter::Info,
+            "warn" => LevelFilter::Warn,
+            "error" => LevelFilter::Error,
+            _ => LevelFilter::Info,
+        }
+    } else {
+        match config.logging.level.to_lowercase().as_str() {
+            "trace" => LevelFilter::Trace,
+            "debug" => LevelFilter::Debug,
+            "info" => LevelFilter::Info,
+            "warn" => LevelFilter::Warn,
+            "error" => LevelFilter::Error,
+            _ => LevelFilter::Info,
+        }
+    };
+
+    log::set_boxed_logger(Box::new(CorkyLogger { max_level: level }))
+        .map(|()| log::set_max_level(level))?;
     Ok(())
 }
 
